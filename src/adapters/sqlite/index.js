@@ -59,6 +59,23 @@ function syncReturnToResult<T>(syncReturn: SyncReturn<T>): Result<T> {
   return { error: new Error('Unknown native bridge response') }
 }
 
+type NativeDispatcher = $Exact<{
+  initialize: (ConnectionTag, string, string, SchemaVersion) => Promise<InitializeStatus>,
+  setUpWithSchema: (ConnectionTag, string, string,  SQL, SchemaVersion) => Promise<void>,
+  setUpWithMigrations: (ConnectionTag, string, string, SQL, SchemaVersion, SchemaVersion) => Promise<void>,
+  find: (ConnectionTag, TableName<any>, RecordId) => Promise<DirtyFindResult>,
+  query: (ConnectionTag, TableName<any>, SQL) => Promise<DirtyQueryResult>,
+  count: (ConnectionTag, SQL) => Promise<number>,
+  batch: (ConnectionTag, NativeBridgeBatchOperation[]) => Promise<void>,
+  batchJSON?: (ConnectionTag, string) => Promise<void>,
+  getDeletedRecords: (ConnectionTag, TableName<any>) => Promise<RecordId[]>,
+  destroyDeletedRecords: (ConnectionTag, TableName<any>, RecordId[]) => Promise<void>,
+  unsafeResetDatabase: (ConnectionTag, SQL, SchemaVersion) => Promise<void>,
+  getLocal: (ConnectionTag, string) => Promise<?string>,
+  setLocal: (ConnectionTag, string, string) => Promise<void>,
+  removeLocal: (ConnectionTag, string) => Promise<void>,
+}>
+
 const dispatcherMethods = [
   'initialize',
   'setUpWithSchema',
@@ -94,6 +111,49 @@ const initializeJSI = () => {
   }
 
   return false
+}
+
+type NativeBridgeType = {
+  // Async methods
+  ...NativeDispatcher,
+
+  // Synchronous methods
+  initializeSynchronous?: (
+    ConnectionTag,
+    string,
+    string,
+    SchemaVersion,
+  ) => SyncReturn<InitializeStatus>,
+  setUpWithSchemaSynchronous?: (
+    ConnectionTag,
+    string,
+    string,
+    SQL,
+    SchemaVersion,
+  ) => SyncReturn<void>,
+  setUpWithMigrationsSynchronous?: (
+    ConnectionTag,
+    string,
+    string,
+    SQL,
+    SchemaVersion,
+    SchemaVersion,
+  ) => SyncReturn<void>,
+  findSynchronous?: (ConnectionTag, TableName<any>, RecordId) => SyncReturn<DirtyFindResult>,
+  querySynchronous?: (ConnectionTag, TableName<any>, SQL) => SyncReturn<DirtyQueryResult>,
+  countSynchronous?: (ConnectionTag, SQL) => SyncReturn<number>,
+  batchSynchronous?: (ConnectionTag, NativeBridgeBatchOperation[]) => SyncReturn<void>,
+  batchJSONSynchronous?: (ConnectionTag, string) => SyncReturn<void>,
+  getDeletedRecordsSynchronous?: (ConnectionTag, TableName<any>) => SyncReturn<RecordId[]>,
+  destroyDeletedRecordsSynchronous?: (
+    ConnectionTag,
+    TableName<any>,
+    RecordId[],
+  ) => SyncReturn<void>,
+  unsafeResetDatabaseSynchronous?: (ConnectionTag, SQL, SchemaVersion) => SyncReturn<void>,
+  getLocalSynchronous?: (ConnectionTag, string) => SyncReturn<?string>,
+  setLocalSynchronous?: (ConnectionTag, string, string) => SyncReturn<void>,
+  removeLocalSynchronous?: (ConnectionTag, string) => SyncReturn<void>,
 }
 
 type DispatcherType = 'asynchronous' | 'synchronous' | 'jsi'
@@ -152,6 +212,7 @@ const makeDispatcher = (
 
 export type SQLiteAdapterOptions = $Exact<{
   dbName?: string,
+  password?: string,
   schema: AppSchema,
   migrations?: SchemaMigrations,
   synchronous?: boolean,
@@ -169,16 +230,21 @@ export default class SQLiteAdapter implements DatabaseAdapter, SQLDatabaseAdapte
 
   _dispatcherType: DispatcherType
 
+  _password: string
+
+  _synchronous: boolean
+
   _dispatcher: NativeDispatcher
 
   _initPromise: Promise<void>
 
   constructor(options: SQLiteAdapterOptions): void {
     // console.log(`---> Initializing new adapter (${this._tag})`)
-    const { dbName, schema, migrations } = options
+    const { dbName, password, schema, migrations } = options
     this.schema = schema
     this.migrations = migrations
     this._dbName = this._getName(dbName)
+    this._password = password || ''
     this._dispatcherType = this._getDispatcherType(options)
     this._dispatcher = makeDispatcher(this._dispatcherType, this._tag, this._dbName)
 
@@ -228,6 +294,7 @@ export default class SQLiteAdapter implements DatabaseAdapter, SQLDatabaseAdapte
   async testClone(options?: $Shape<SQLiteAdapterOptions> = {}): Promise<SQLiteAdapter> {
     const clone = new SQLiteAdapter({
       dbName: this._dbName,
+      password: this._password,
       schema: this.schema,
       synchronous: this._dispatcherType === 'synchronous',
       experimentalUseJSI: this._dispatcherType === 'jsi',
@@ -255,9 +322,12 @@ export default class SQLiteAdapter implements DatabaseAdapter, SQLDatabaseAdapte
     // we're good. If not, we try again, this time sending the compiled schema or a migration set
     // This is to speed up the launch (less to do and pass through bridge), and avoid repeating
     // migration logic inside native code
-    const status = await toPromise(callback =>
-      this._dispatcher.initialize(this._dbName, this.schema.version, callback),
-    )
+    const status = await toPromise(callback => this._dispatcher.initialize(
+      this._dbName,
+      this._password,
+      this.schema.version,
+      callback
+    ))
 
     // NOTE: Race condition - logic here is asynchronous, but synchronous-mode adapter does not allow
     // for queueing operations. will fail if you start making actions immediately
@@ -287,6 +357,7 @@ export default class SQLiteAdapter implements DatabaseAdapter, SQLDatabaseAdapte
         await toPromise(callback =>
           this._dispatcher.setUpWithMigrations(
             this._dbName,
+            this._password,
             this._encodeMigrations(migrationSteps),
             databaseVersion,
             this.schema.version,
@@ -313,6 +384,7 @@ export default class SQLiteAdapter implements DatabaseAdapter, SQLDatabaseAdapte
     await toPromise(callback =>
       this._dispatcher.setUpWithSchema(
         this._dbName,
+        this._password,
         this._encodedSchema(),
         this.schema.version,
         callback,
